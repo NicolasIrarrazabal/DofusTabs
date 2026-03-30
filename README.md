@@ -1,6 +1,6 @@
 # ⚙️ Dofus WindowTabs + AutoFocus
 
-Herramienta personal para manejar múltiples ventanas de Dofus.
+Herramienta personal para manejar múltiples ventanas de Dofus RETRO.
 
 - AutoFocus en eventos (turno, trade, grupo)
 - Organización tipo tabs
