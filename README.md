@@ -19,12 +19,17 @@ DofusTabs es una herramienta diseñada para facilitar la gestión de múltiples 
   - Guarda configuraciones de ventanas
   - Permite ordenar rápidamente tus cuentas
 
+- ⌨️ **Atajos de teclado**
+  - `F1`: cambiar a la pestaña anterior
+  - `F2`: cambiar a la pestaña siguiente
+  - `F3`: ocultar/mostrar el menú
+
 ## 🛠 Requisitos
 
 - Windows
 - .NET (según versión del proyecto)
 - **Npcap**
-- 
+
 Descarga:
 https://nmap.org/npcap/
 
