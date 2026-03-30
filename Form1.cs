@@ -799,6 +799,33 @@ namespace DofusMiniTabber
             info.LastKnownSize = size;
         }
 
+        private void FocusEmbeddedWindow(IntPtr hwnd)
+        {
+            try
+            {
+                if (IsIconic(hwnd))
+                    ShowWindow(hwnd, SW_SHOW);
+
+                IntPtr fg = GetForegroundWindow();
+                uint fgThread = GetWindowThreadProcessId(fg, out _);
+                uint myThread = GetCurrentThreadId();
+
+                if (fgThread != myThread)
+                {
+                    AttachThreadInput(fgThread, myThread, true);
+                    SetForegroundWindow(hwnd);
+                    BringWindowToTop(hwnd);
+                    AttachThreadInput(fgThread, myThread, false);
+                }
+                else
+                {
+                    SetForegroundWindow(hwnd);
+                    BringWindowToTop(hwnd);
+                }
+            }
+            catch { }
+        }
+
         private void OnTabChanged()
         {
             var currentTab = _tabs.SelectedTab;
@@ -816,6 +843,9 @@ namespace DofusMiniTabber
             {
                 active.LastKnownSize = Size.Empty;
                 ResizeWindowIfNeeded(active);
+
+                // 🔥 ESTA ES LA PARTE IMPORTANTE
+                FocusEmbeddedWindow(active.Hwnd);
             }
 
             _previousTab = currentTab;
@@ -1077,11 +1107,18 @@ namespace DofusMiniTabber
                 if (info != null)
                 {
                     string windowTitle = GetWindowTitle(info.Hwnd).Trim();
+
                     if (windowTitle.StartsWith(characterName, StringComparison.OrdinalIgnoreCase))
                     {
                         if (_tabs.SelectedIndex != i)
                             _tabs.SelectedIndex = i;
-                        ForceWindowToForeground();
+
+                        // 🔥 CLAVE: esperar a que la UI termine
+                        BeginInvoke(new Action(() =>
+                        {
+                            FocusEmbeddedWindow(info.Hwnd);
+                        }));
+
                         return;
                     }
                 }
