@@ -36,8 +36,18 @@ namespace DofusMiniTabber
             ["Fallaster"]   = "34.255.49.243",
             ["Fallaster2"]  = "54.228.180.96",
         };
+
+        // ── HashSet de IPs remotas protegido por lock (thread-safe) ──────────
+        // Usamos lock porque el HashSet puede ser modificado desde Task.Run()
+        // (DNS async) simultáneamente con lecturas desde el hilo de captura.
         private readonly HashSet<string> _remoteIPs;
-        private const int    RemotePort = 443;
+        private readonly object          _serversLock = new();
+
+        // ── Set de hosts cuya resolución DNS ya está en curso / completada ───
+        // Evita lanzar múltiples Task.Run para el mismo hostname.
+        private readonly HashSet<string> _pendingHostResolutions = [];
+
+        private const int RemotePort = 443;
 
         // ── Estado ────────────────────────────────────────────────────────────
         private readonly ConcurrentDictionary<string, CharInfo>        _allDetected   = new();
@@ -162,7 +172,7 @@ namespace DofusMiniTabber
         }
 
         // ═════════════════════════════════════════════════════════════════════
-        //  Llegada de paquete - CON LOGGING DE TIMING
+        //  Llegada de paquete
         // ═════════════════════════════════════════════════════════════════════
         private void OnPacketArrival(object _, PacketCapture e)
         {
@@ -181,17 +191,39 @@ namespace DofusMiniTabber
                 string src = ip.SourceAddress.ToString();
                 string dst = ip.DestinationAddress.ToString();
 
-                bool fromServer = _remoteIPs.Contains(src);
-                bool toServer   = _remoteIPs.Contains(dst);
+                int payload = tcp.PayloadData?.Length ?? 0;
+                if (payload == 0) return;
+
+                // ── AUTODETECCIÓN DE SERVIDORES (antes del filtro de IP) ──────
+                // Igual que en la versión Python: buscamos hostnames de Ankama
+                // en TODOS los paquetes del puerto 443, incluso los de IPs
+                // desconocidas. Si encontramos uno, resolvemos su IP por DNS
+                // en background y la añadimos a _remoteIPs para que los
+                // paquetes siguientes de ese servidor pasen el filtro.
+                byte first = tcp.PayloadData![0];
+                bool likelyTls = first >= 0x14 && first <= 0x17;
+
+                if (!likelyTls)
+                {
+                    string rawText = Encoding.Latin1.GetString(tcp.PayloadData!, 0, payload);
+                    var hm = RxHost.Match(rawText);
+                    if (hm.Success)
+                        TryAutodetectServerAsync(hm.Value);
+                }
+                // ─────────────────────────────────────────────────────────────
+
+                // ── Filtro por IP: solo tráfico de/hacia servidores conocidos ─
+                bool fromServer, toServer;
+                lock (_serversLock)
+                {
+                    fromServer = _remoteIPs.Contains(src);
+                    toServer   = _remoteIPs.Contains(dst);
+                }
                 if (!fromServer && !toServer) return;
 
                 Interlocked.Increment(ref _dofusPkts);
 
-                int payload = tcp.PayloadData?.Length ?? 0;
-                if (payload == 0) return;
-
-                byte first = tcp.PayloadData![0];
-                if (first >= 0x14 && first <= 0x17)
+                if (likelyTls)
                 {
                     string flowKey = $"{src}:{tcp.SourcePort}->{dst}:{tcp.DestinationPort}";
                     if (_tlsWarnedFlows.Add(flowKey))
@@ -211,6 +243,69 @@ namespace DofusMiniTabber
                 FeedStream(flowId, tcp.PayloadData, localPort, server, arrivalTime);
             }
             catch { }
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  Autodetección asíncrona de servidores nuevos
+        //
+        //  Lógica equivalente a la versión Python:
+        //
+        //      match = HOST_REGEX.search(data)
+        //      if match:
+        //          ip = socket.gethostbyname(host)
+        //          if ip not in REMOTE_IPS:
+        //              REMOTE_IPS.add(ip)
+        //              SERVERS[nombre_server] = ip
+        //
+        //  Diferencias respecto a la versión anterior (TryResolveNewServer):
+        //  · Se llama ANTES del filtro de IP → detecta servidores nuevos
+        //    incluso si su IP aún no está en _remoteIPs.
+        //  · La resolución DNS se hace en Task.Run para no bloquear el hilo
+        //    de captura de paquetes.
+        //  · _pendingHostResolutions evita lanzar múltiples tareas para el
+        //    mismo host.
+        // ═════════════════════════════════════════════════════════════════════
+        private void TryAutodetectServerAsync(string host)
+        {
+            lock (_serversLock)
+            {
+                // Si ya estamos resolviendo (o resolvimos) este host, salimos.
+                if (!_pendingHostResolutions.Add(host)) return;
+            }
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    var addresses = await Dns.GetHostAddressesAsync(host).ConfigureAwait(false);
+                    foreach (var addr in addresses)
+                    {
+                        string ip = addr.ToString();
+                        bool isNew;
+                        lock (_serversLock)
+                        {
+                            isNew = _remoteIPs.Add(ip);
+                            if (isNew)
+                            {
+                                // Extraer nombre legible del hostname:
+                                // "dofusretro-fallaster-01.ankama-games.com" → "fallaster-01"
+                                string name = host.Contains('-')
+                                    ? string.Join('-', host.Split('-')[1..]).Split('.')[0]
+                                    : host;
+                                _servers[name] = ip;
+                            }
+                        }
+                        if (isNew)
+                            Log("NET", $"🆕 Servidor autodetectado: {host} → {ip}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log("WARN", $"DNS fallido para '{host}': {ex.Message}");
+                    // Quitar del set para poder reintentar en el próximo paquete
+                    lock (_serversLock) _pendingHostResolutions.Remove(host);
+                }
+            });
         }
 
         // ═════════════════════════════════════════════════════════════════════
@@ -318,8 +413,11 @@ namespace DofusMiniTabber
         {
             if (IsLikelyEncrypted(text)) return;
 
+            // Hostname en mensaje ya reensamblado — complementa la detección
+            // temprana de OnPacketArrival (cubre el caso de hostnames que llegan
+            // partidos entre dos paquetes y solo son visibles tras el reassembly).
             var hm = RxHost.Match(text);
-            if (hm.Success) TryResolveNewServer(hm.Value);
+            if (hm.Success) TryAutodetectServerAsync(hm.Value);
 
             foreach (Match m in RxAsk.Matches(text))
             {
@@ -396,26 +494,11 @@ namespace DofusMiniTabber
 
         private string GetServerName(string ip)
         {
-            foreach (var kv in _servers) if (kv.Value == ip) return kv.Key;
-            return ip;
-        }
-
-        private void TryResolveNewServer(string host)
-        {
-            try
+            lock (_serversLock)
             {
-                foreach (var addr in System.Net.Dns.GetHostAddresses(host))
-                {
-                    string ip = addr.ToString();
-                    if (_remoteIPs.Add(ip))
-                    {
-                        string s = host.Contains('-') ? host.Split('-')[1].Split('.')[0] : host;
-                        _servers[s] = ip;
-                        Log("NET", $"Nuevo servidor: {host} -> {ip}");
-                    }
-                }
+                foreach (var kv in _servers) if (kv.Value == ip) return kv.Key;
             }
-            catch { }
+            return ip;
         }
 
         // ═════════════════════════════════════════════════════════════════════
