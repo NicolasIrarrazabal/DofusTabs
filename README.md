@@ -17,3 +17,6 @@ Puede fallar y su uso podría ir en contra de los TOS de Ankama.
 ⚠️ Importante
 Para que el AutoFocus funcione correctamente debes conectarte al personaje 
 (desde la selección de personaje). Si ya estás conectado, reconecta.
+
+
+<img width="1914" height="1036" alt="image" src="https://github.com/user-attachments/assets/e39ff398-7019-4e52-9690-8ff03190b2f8" />
