@@ -1,4 +1,4 @@
-# ⚙️ Dofus WindowTabs + AutoFocus
+# ⚙️ Dofus Retro WindowTabs + AutoFocus
 
 Herramienta personal para manejar múltiples ventanas de Dofus RETRO.
 
