@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <AssemblyTitle>Wintabber Dofus</AssemblyTitle>
+    <Product>Wintabber Dofus</Product>
+  </PropertyGroup>
+
+  <!--
+    Dependencias NuGet (captura de red, requiere Npcap instalado):
+      dotnet add package SharpPcap
+      dotnet add package PacketDotNet
+
+    Requiere Npcap instalado con "WinPcap API-compatible mode":
+      https://npcap.com/#download
+
+    NOTA: El monitor de red se ejecuta solo si Npcap está instalado y
+    el programa se lanza como Administrador. Sin esos requisitos,
+    la aplicación funciona igualmente (solo sin autofocus/autotrade/autogroup).
+  -->
+  <ItemGroup>
+    <PackageReference Include="SharpPcap"    Version="6.3.0" />
+    <PackageReference Include="PacketDotNet" Version="1.4.7" />
+  </ItemGroup>
+
+</Project>
