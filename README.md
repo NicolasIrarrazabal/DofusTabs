@@ -6,6 +6,7 @@ Herramienta personal para manejar múltiples ventanas de Dofus RETRO.
 - AutoFocus en eventos (turno, trade, grupo)
 - Organización tipo tabs
 - Cambio rápido entre ventanas con F1 / F2
+- Oculta Menu con F3
 - Loadouts, Guarda tu orden favorito de personajes sin perder tiempo ordenando las Tabs. (En el programa dice Layouts)
 
 📌 Nota
