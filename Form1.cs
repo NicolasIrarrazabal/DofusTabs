@@ -3,6 +3,7 @@
  *
  * - Interfaz moderna con tabs smooth y colores refinados
  * - Toggles de Autofocus, Autotrade y Autogroup en el menú
+ * - Nueva instancia vía hilo STA (salta la restricción de Mutex)
  * - Sin menciones técnicas, interfaz amigable para el usuario
  */
 
@@ -11,6 +12,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -121,7 +123,8 @@ namespace DofusMiniTabber
                 ? new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
                 : new Font("Segoe UI",           8.5f, FontStyle.Regular);
 
-            var textRect = new RectangleF(rect.X + 2, rect.Y + accentH, rect.Width - 4, rect.Height - accentH);            g.DrawString(txt, font, fgBrush, textRect, sf);
+            var textRect = new RectangleF(rect.X + 2, rect.Y + accentH, rect.Width - 4, rect.Height - accentH);
+            g.DrawString(txt, font, fgBrush, textRect, sf);
             font.Dispose();
         }
     }
@@ -153,6 +156,8 @@ namespace DofusMiniTabber
                     bg = Color.FromArgb(0x0A, 0x2E, 0x18);
                 else if (btn.Tag is "toggle-off")
                     bg = Color.FromArgb(0x2E, 0x0A, 0x0A);
+                else if (btn.Tag is "accent")
+                    bg = Color.FromArgb(0x0C, 0x2A, 0x50);
                 else
                     bg = Color.FromArgb(0x10, 0x1E, 0x32);
 
@@ -160,9 +165,11 @@ namespace DofusMiniTabber
                 using (var brush = new SolidBrush(bg))
                     g.FillPath(brush, path);
 
-                Color border = btn.Selected
-                    ? Color.FromArgb(0x2A, 0x70, 0xCC)
-                    : Color.FromArgb(0x1C, 0x34, 0x55);
+                Color border = btn.Tag is "accent"
+                    ? Color.FromArgb(0x3D, 0x9B, 0xFF)
+                    : btn.Selected
+                        ? Color.FromArgb(0x2A, 0x70, 0xCC)
+                        : Color.FromArgb(0x1C, 0x34, 0x55);
                 using var pen = new Pen(border, 1f);
                 g.DrawPath(pen, path);
             }
@@ -227,6 +234,7 @@ namespace DofusMiniTabber
         private readonly ToolStrip       _toolbar              = new();
         private readonly ToolStrip       _floatingToolbar      = new();
         private readonly ToolStripButton _captureButton        = new();
+        private readonly ToolStripButton _newInstanceButton    = new();
         private readonly ToolStripButton _savePositionButton   = new();
         private readonly ToolStripButton _restorePositionButton= new();
         private readonly ToolStripButton _loadPreferredButton  = new();
@@ -249,9 +257,11 @@ namespace DofusMiniTabber
         private readonly ContextMenuStrip _trayMenu            = new();
         private bool    _menuVisible         = true;
         private bool    _isCapturing;
+        private bool    _isDisposing;
         private TabPage? _previousTab;
         private TabPage? _draggedTab;
         private string? _preferredLayoutName = null;
+        private readonly int     _instanceId;
 
         // Estados de toggles
         private bool _autofocusEnabled = true;
@@ -269,6 +279,7 @@ namespace DofusMiniTabber
         private const int HOTKEY_ID_SAVE_POS     = 4;
         private const int HOTKEY_ID_RESTORE_POS  = 5;
         private const int HOTKEY_ID_MANAGE       = 6;
+        private const int HOTKEY_ID_NEW_INSTANCE = 7;
         private const int HOTKEY_ID_NUM_START    = 10;
 
         private const uint MOD_ALT      = 0x0001;
@@ -340,9 +351,16 @@ namespace DofusMiniTabber
 
         private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lp);
 
+        // Contador estático para IDs de instancia
+        private static int _nextInstanceId = 1;
+        private static readonly object _instanceLock = new();
+
         // ═════════════════════════════════════════════════════════════════════
         public Form1()
         {
+            lock (_instanceLock)
+                _instanceId = _nextInstanceId++;
+
             ConfigureForm();
             BuildUi();
             SetupTrayIcon();
@@ -367,7 +385,7 @@ namespace DofusMiniTabber
             {
                 _monitor = new DofusNetMonitor(name =>
                 {
-                    if (IsHandleCreated)
+                    if (IsHandleCreated && !_isDisposing)
                         BeginInvoke(() => ActivateTabByCharacterName(name));
                 });
 
@@ -383,26 +401,35 @@ namespace DofusMiniTabber
         // ═════════════════════════════════════════════════════════════════════
         private void ConfigureForm()
         {
-            Text        = "Wintabber Dofus";
+            Text        = $"Wintabber Dofus — #{_instanceId}";
             BackColor   = Color.FromArgb(0x0D, 0x15, 0x1F);
             WindowState = FormWindowState.Maximized;
             KeyPreview  = true;
             FormClosing += OnFormClosingRestoreWindows;
+            FormClosed  += (_, _) =>
+            {
+                _isDisposing = true;
+                _updateTitleTimer.Stop();
+                _statsTimer.Stop();
+                _resizeDebounceTimer.Stop();
+                _monitor?.Stop();
+            };
             TopMost     = false;
         }
 
         private void SetupTrayIcon()
         {
-            _trayIcon.Icon    = Icon ?? CreateFallbackIcon();
-            _trayIcon.Text    = "Wintabber Dofus";
+            _trayIcon.Icon    = Icon ?? CreateFallbackIcon(_instanceId);
+            _trayIcon.Text    = $"Wintabber Dofus #{_instanceId}";
             _trayIcon.Visible = true;
 
-            var restoreItem = new ToolStripMenuItem("Restaurar",         null, (_, _) => RestoreWindow());
-            var captureItem = new ToolStripMenuItem("Capturar ventanas", null, (_, _) => CaptureWindows());
-            var sep         = new ToolStripSeparator();
-            var exitItem    = new ToolStripMenuItem("Salir",             null, (_, _) => ExitApplication());
+            var restoreItem    = new ToolStripMenuItem("Restaurar",          null, (_, _) => RestoreWindow());
+            var captureItem    = new ToolStripMenuItem("Capturar ventanas",  null, (_, _) => CaptureWindows());
+            var newInstanceItem= new ToolStripMenuItem("Nueva instancia",     null, (_, _) => OpenNewInstance());
+            var sep            = new ToolStripSeparator();
+            var exitItem       = new ToolStripMenuItem("Salir",              null, (_, _) => ExitApplication());
 
-            _trayMenu.Items.AddRange(new ToolStripItem[] { restoreItem, captureItem, sep, exitItem });
+            _trayMenu.Items.AddRange(new ToolStripItem[] { restoreItem, captureItem, newInstanceItem, sep, exitItem });
             _trayMenu.BackColor  = Color.FromArgb(0x0A, 0x12, 0x1C);
             _trayMenu.ForeColor  = Color.FromArgb(0xCC, 0xDD, 0xEE);
             _trayMenu.RenderMode = ToolStripRenderMode.System;
@@ -411,13 +438,15 @@ namespace DofusMiniTabber
             _trayIcon.DoubleClick += (_, _) => RestoreWindow();
         }
 
-        private static Icon CreateFallbackIcon()
+        private static Icon CreateFallbackIcon(int instanceId)
         {
             using var bmp  = new Bitmap(16, 16);
             using var g    = Graphics.FromImage(bmp);
             g.Clear(Color.FromArgb(0x0A, 0x12, 0x1C));
-            using var font = new Font("Segoe UI", 8f, FontStyle.Bold);
-            g.DrawString("W", font, Brushes.White, 1f, 1f);
+            using var font = new Font("Segoe UI", 7f, FontStyle.Bold);
+            var label = instanceId <= 9 ? instanceId.ToString() : "+";
+            var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            g.DrawString(label, font, Brushes.White, 8f, 8f, sf);
             return Icon.FromHandle(bmp.GetHicon());
         }
 
@@ -447,14 +476,16 @@ namespace DofusMiniTabber
             _floatingToolbar.Padding     = new Padding(6, 0, 6, 0);
             _floatingToolbar.Renderer    = new ModernToolStripRenderer();
 
-            StyleButton(_captureButton,         "⚡  Capturar Tabs",  "Capturar todas las ventanas de Dofus abiertas");
-            StyleButton(_savePositionButton,    "💾  Guardar",   "Guardar el orden actual de las pestañas como layout");
-            StyleButton(_restorePositionButton, "🔁  Cargar",    "Cargar un layout guardado");
-            StyleButton(_loadPreferredButton,   "⭐  Loadout favorito", "Cargar el layout preferido");
-            StyleButton(_manageLayoutsButton,   "📋  Loadouts",   "Gestionar layouts guardados");
-            StyleButton(_hideMenuButton,        "👁  Menú",      "Mostrar u ocultar esta barra");
+            StyleButton(_captureButton,          "⚡  Capturar Tabs",   "Capturar todas las ventanas de Dofus abiertas");
+            StyleAccentButton(_newInstanceButton, "➕  Nueva Instancia", "Abrir otra ventana de Wintabber Dofus independiente");
+            StyleButton(_savePositionButton,     "💾  Guardar",        "Guardar el orden actual de las pestañas como layout");
+            StyleButton(_restorePositionButton,  "🔁  Cargar",         "Cargar un layout guardado");
+            StyleButton(_loadPreferredButton,    "⭐  Loadout favorito","Cargar el layout preferido");
+            StyleButton(_manageLayoutsButton,    "📋  Loadouts",       "Gestionar layouts guardados");
+            StyleButton(_hideMenuButton,         "👁  Menú",           "Mostrar u ocultar esta barra");
 
             _captureButton.Click          += (_, _) => CaptureWindows();
+            _newInstanceButton.Click      += (_, _) => OpenNewInstance();
             _savePositionButton.Click     += (_, _) => SaveCurrentPositions();
             _restorePositionButton.Click  += (_, _) => QuickRestoreLayout();
             _loadPreferredButton.Click    += (_, _) => LoadPreferredLayout();
@@ -478,12 +509,13 @@ namespace DofusMiniTabber
                 ref _autogroupEnabled, _toggleAutogroupBtn,
                 v => { if (_monitor != null) _monitor.FeatureAutogroup = v; });
 
-            _hotkeysLabel.Text      = "F1/F2 Ant·Sig   F3 Menú   F4 Guardar   F5 Cargar   F6 Layouts   Ctrl+Alt+1..9";
+            _hotkeysLabel.Text      = "F1/F2 Ant·Sig   F3 Menú   F4 Guardar   F5 Cargar   F6 Layouts   F7 Nueva   Ctrl+Alt+1..9";
             _hotkeysLabel.ForeColor = Color.FromArgb(0x33, 0x55, 0x77);
             _hotkeysLabel.Alignment = ToolStripItemAlignment.Right;
             _hotkeysLabel.Font      = new Font("Segoe UI", 7.5f);
 
             _floatingToolbar.Items.Add(_captureButton);
+            _floatingToolbar.Items.Add(_newInstanceButton);
             _floatingToolbar.Items.Add(new ToolStripSeparator());
             _floatingToolbar.Items.Add(_savePositionButton);
             _floatingToolbar.Items.Add(_restorePositionButton);
@@ -536,6 +568,13 @@ namespace DofusMiniTabber
             btn.AutoSize     = true;
             btn.Margin       = new Padding(2, 4, 2, 4);
             btn.Padding      = new Padding(8, 0, 8, 0);
+        }
+
+        private static void StyleAccentButton(ToolStripButton btn, string text, string tooltip)
+        {
+            StyleButton(btn, text, tooltip);
+            btn.Tag        = "accent";
+            btn.ForeColor  = Color.FromArgb(0x8E, 0xD4, 0xFF);
         }
 
         private static void SetupToggleButton(ToolStripButton btn, string text, string tooltip, bool enabled)
@@ -602,6 +641,51 @@ namespace DofusMiniTabber
             _draggedTab = null;
         }
 
+        // ═════════════════════════════════════════════════════════════════════
+        //  Nueva Instancia — hilo STA propio, sin Mutex, sin Process.Start
+        // ═════════════════════════════════════════════════════════════════════
+        private void OpenNewInstance()
+        {
+            if (_isDisposing) return;
+
+            try
+            {
+                var thread = new Thread(() =>
+                {
+                    try
+                    {
+                        Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
+                        using var form = new Form1();
+                        Application.Run(form);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"[Instance {_instanceId}] Spawn error: {ex.Message}");
+                        try
+                        {
+                            MessageBox.Show(
+                                $"Error al abrir nueva instancia:\n{ex.Message}",
+                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                        }
+                        catch { }
+                    }
+                })
+                {
+                    Name = $"Wintabber-Instance-{_instanceId + 1}",
+                    IsBackground = true
+                };
+                thread.SetApartmentState(ApartmentState.STA);
+                thread.Start();
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    $"No se pudo abrir una nueva instancia:\n{ex.Message}",
+                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
         private void ReleaseCurrentTab()
         {
             if (_tabs.SelectedTab == null) return;
@@ -651,12 +735,13 @@ namespace DofusMiniTabber
 
         private void RegisterBaseHotkeys()
         {
-            RegisterHotKey(Handle, HOTKEY_ID_PREV,        MOD_NOREPEAT, (uint)Keys.F1);
-            RegisterHotKey(Handle, HOTKEY_ID_NEXT,        MOD_NOREPEAT, (uint)Keys.F2);
-            RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_MENU, MOD_NOREPEAT, (uint)Keys.F3);
-            RegisterHotKey(Handle, HOTKEY_ID_SAVE_POS,    MOD_NOREPEAT, (uint)Keys.F4);
-            RegisterHotKey(Handle, HOTKEY_ID_RESTORE_POS, MOD_NOREPEAT, (uint)Keys.F5);
-            RegisterHotKey(Handle, HOTKEY_ID_MANAGE,      MOD_NOREPEAT, (uint)Keys.F6);
+            RegisterHotKey(Handle, HOTKEY_ID_PREV,          MOD_NOREPEAT, (uint)Keys.F1);
+            RegisterHotKey(Handle, HOTKEY_ID_NEXT,          MOD_NOREPEAT, (uint)Keys.F2);
+            RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_MENU,   MOD_NOREPEAT, (uint)Keys.F3);
+            RegisterHotKey(Handle, HOTKEY_ID_SAVE_POS,      MOD_NOREPEAT, (uint)Keys.F4);
+            RegisterHotKey(Handle, HOTKEY_ID_RESTORE_POS,   MOD_NOREPEAT, (uint)Keys.F5);
+            RegisterHotKey(Handle, HOTKEY_ID_MANAGE,        MOD_NOREPEAT, (uint)Keys.F6);
+            RegisterHotKey(Handle, HOTKEY_ID_NEW_INSTANCE,  MOD_NOREPEAT, (uint)Keys.F7);
         }
 
         private void RegisterNumberHotkeys()
@@ -677,12 +762,13 @@ namespace DofusMiniTabber
             if (m.Msg == WM_HOTKEY)
             {
                 var id = m.WParam.ToInt32();
-                if      (id == HOTKEY_ID_PREV)        PrevTab();
-                else if (id == HOTKEY_ID_NEXT)        NextTab();
-                else if (id == HOTKEY_ID_TOGGLE_MENU) ToggleFloatingMenu();
-                else if (id == HOTKEY_ID_SAVE_POS)    SaveCurrentPositions();
-                else if (id == HOTKEY_ID_RESTORE_POS) QuickRestoreLayout();
-                else if (id == HOTKEY_ID_MANAGE)      OpenLayoutManager();
+                if      (id == HOTKEY_ID_PREV)          PrevTab();
+                else if (id == HOTKEY_ID_NEXT)          NextTab();
+                else if (id == HOTKEY_ID_TOGGLE_MENU)   ToggleFloatingMenu();
+                else if (id == HOTKEY_ID_SAVE_POS)      SaveCurrentPositions();
+                else if (id == HOTKEY_ID_RESTORE_POS)   QuickRestoreLayout();
+                else if (id == HOTKEY_ID_MANAGE)        OpenLayoutManager();
+                else if (id == HOTKEY_ID_NEW_INSTANCE)  OpenNewInstance();
                 else if (id >= HOTKEY_ID_NUM_START && id <= HOTKEY_ID_NUM_START + 8)
                     JumpToTab(id - HOTKEY_ID_NUM_START);
             }
@@ -738,17 +824,18 @@ namespace DofusMiniTabber
                 var sb    = new StringBuilder(1024);
                 uint size = (uint)sb.Capacity;
                 if (!QueryFullProcessImageName(hProcess, 0, sb, ref size)) return false;
-                return System.IO.Path.GetFileName(sb.ToString())
+                return Path.GetFileName(sb.ToString())
                     .Equals(TARGET_PROCESS_NAME, StringComparison.OrdinalIgnoreCase);
             }
             finally { CloseHandle(hProcess); }
         }
 
-        private string ShortenText(string text, int maxLength = 18)
+        private static string ShortenText(string text, int maxLength = 18)
         {
             if (string.IsNullOrEmpty(text)) return text;
             return text.Length <= maxLength ? text : text.Substring(0, maxLength) + "...";
         }
+
         private void EmbedWindow(IntPtr hwnd, string title)
         {
             var panel     = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
@@ -843,8 +930,6 @@ namespace DofusMiniTabber
             {
                 active.LastKnownSize = Size.Empty;
                 ResizeWindowIfNeeded(active);
-
-                // 🔥 ESTA ES LA PARTE IMPORTANTE
                 FocusEmbeddedWindow(active.Hwnd);
             }
 
@@ -1089,7 +1174,7 @@ namespace DofusMiniTabber
         {
             if (string.IsNullOrWhiteSpace(_preferredLayoutName))
             {
-                _loadPreferredButton.Text        = "⭐  Louadout Favorito";
+                _loadPreferredButton.Text        = "⭐  Loadout Favorito";
                 _loadPreferredButton.ToolTipText = "Ningún layout preferido configurado";
             }
             else
@@ -1113,7 +1198,6 @@ namespace DofusMiniTabber
                         if (_tabs.SelectedIndex != i)
                             _tabs.SelectedIndex = i;
 
-                        // 🔥 CLAVE: esperar a que la UI termine
                         BeginInvoke(new Action(() =>
                         {
                             FocusEmbeddedWindow(info.Hwnd);
@@ -1199,16 +1283,22 @@ namespace DofusMiniTabber
 
         private void OnFormClosingRestoreWindows(object? sender, FormClosingEventArgs e)
         {
+            _isDisposing = true;
             _monitor?.Stop();
+
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
 
             foreach (var item in _embeddedByHwnd.Values)
             {
-                SetParent(item.Hwnd, IntPtr.Zero);
-                SetWindowLong(item.Hwnd, GWL_STYLE, item.OriginalStyle);
-                SetWindowPos(item.Hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
-                ShowWindow(item.Hwnd, SW_SHOW);
+                try
+                {
+                    SetParent(item.Hwnd, IntPtr.Zero);
+                    SetWindowLong(item.Hwnd, GWL_STYLE, item.OriginalStyle);
+                    SetWindowPos(item.Hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+                    ShowWindow(item.Hwnd, SW_SHOW);
+                }
+                catch { }
             }
 
             UnregisterHotKey(Handle, HOTKEY_ID_PREV);
@@ -1217,6 +1307,7 @@ namespace DofusMiniTabber
             UnregisterHotKey(Handle, HOTKEY_ID_SAVE_POS);
             UnregisterHotKey(Handle, HOTKEY_ID_RESTORE_POS);
             UnregisterHotKey(Handle, HOTKEY_ID_MANAGE);
+            UnregisterHotKey(Handle, HOTKEY_ID_NEW_INSTANCE);
             for (int i = 0; i < 9; i++) UnregisterHotKey(Handle, HOTKEY_ID_NUM_START + i);
         }
 
