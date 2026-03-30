@@ -29,7 +29,7 @@ namespace DofusMiniTabber
             SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
                      ControlStyles.OptimizedDoubleBuffer, true);
             DrawMode = TabDrawMode.OwnerDrawFixed;
-            ItemSize = new Size(0, 36);
+            ItemSize = new Size(60, 36);
         }
 
         protected override void OnMouseMove(MouseEventArgs e)
@@ -110,7 +110,7 @@ namespace DofusMiniTabber
 
             var sf = new StringFormat
             {
-                Alignment     = StringAlignment.Center,
+                Alignment     = StringAlignment.Near,
                 LineAlignment = StringAlignment.Center,
                 Trimming      = StringTrimming.EllipsisCharacter,
                 FormatFlags   = StringFormatFlags.NoWrap
@@ -121,8 +121,7 @@ namespace DofusMiniTabber
                 ? new Font("Segoe UI Semibold", 8.5f, FontStyle.Bold)
                 : new Font("Segoe UI",           8.5f, FontStyle.Regular);
 
-            var textRect = new RectangleF(rect.X + 4, rect.Y + accentH, rect.Width - 8, rect.Height - accentH);
-            g.DrawString(txt, font, fgBrush, textRect, sf);
+            var textRect = new RectangleF(rect.X + 2, rect.Y + accentH, rect.Width - 4, rect.Height - accentH);            g.DrawString(txt, font, fgBrush, textRect, sf);
             font.Dispose();
         }
     }
@@ -745,11 +744,16 @@ namespace DofusMiniTabber
             finally { CloseHandle(hProcess); }
         }
 
+        private string ShortenText(string text, int maxLength = 18)
+        {
+            if (string.IsNullOrEmpty(text)) return text;
+            return text.Length <= maxLength ? text : text.Substring(0, maxLength) + "...";
+        }
         private void EmbedWindow(IntPtr hwnd, string title)
         {
             var panel     = new Panel { Dock = DockStyle.Fill, BackColor = Color.Black };
             string cleanT = string.IsNullOrWhiteSpace(title) ? TARGET_PROCESS_NAME : title.Trim();
-            var tab       = new TabPage($"{_tabs.TabCount + 1}. {cleanT}");
+            var tab = new TabPage($"{_tabs.TabCount + 1}. {ShortenText(cleanT)}");
             tab.Controls.Add(panel);
             _tabs.TabPages.Add(tab);
 
@@ -839,7 +843,7 @@ namespace DofusMiniTabber
                 string currentTitle = GetWindowTitle(info.Hwnd).Trim();
                 if (string.IsNullOrWhiteSpace(currentTitle)) currentTitle = TARGET_PROCESS_NAME;
                 int    index    = _tabs.TabPages.IndexOf(info.TabPage) + 1;
-                string expected = $"{index}. {currentTitle}";
+                string expected = $"{index}. {ShortenText(currentTitle)}";
                 if (info.TabPage.Text != expected) info.TabPage.Text = expected;
             }
         }
