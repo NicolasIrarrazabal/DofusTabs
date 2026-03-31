@@ -4,7 +4,7 @@
  * - Interfaz moderna con tabs smooth y colores refinados
  * - Toggles de Autofocus, Autotrade y Autogroup en el menú
  * - Nueva instancia vía hilo STA (salta la restricción de Mutex)
- * - Sin menciones técnicas, interfaz amigable para el usuario
+ * - Hook inteligente: Funciona sin click previo, sobrevive al cerrar instancias
  */
 
 using System;
@@ -226,6 +226,199 @@ namespace DofusMiniTabber
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    //  Hook Global Inteligente — Sobrevive al cierre de instancias
+    // ════════════════════════════════════════════════════════════════════════
+    public static class GlobalHookManager
+    {
+        private const int WH_KEYBOARD_LL = 13;
+        private const int WM_KEYDOWN = 0x0100;
+        private const int WM_SYSKEYDOWN = 0x0104;
+
+        private static IntPtr _hookId = IntPtr.Zero;
+        private static HookProc? _proc;
+        private static readonly List<Form1> _instances = new();
+        private static readonly object _lock = new();
+        private static Form1? _lastActiveInstance;
+
+        public static void Register(Form1 instance)
+        {
+            lock (_lock)
+            {
+                if (!_instances.Contains(instance))
+                    _instances.Add(instance);
+                
+                if (_instances.Count == 1)
+                    instance.BeginInvoke(new Action(InstallHook));
+            }
+        }
+
+        public static void Unregister(Form1 instance)
+        {
+            lock (_lock)
+            {
+                _instances.Remove(instance);
+                if (_lastActiveInstance == instance)
+                    _lastActiveInstance = _instances.FirstOrDefault();
+
+                if (_instances.Count == 0)
+                {
+                    // Última instancia: destruir hook
+                    if (_hookId != IntPtr.Zero)
+                    {
+                        UnhookWindowsHookEx(_hookId);
+                        _hookId = IntPtr.Zero;
+                    }
+                }
+                else
+                {
+                    // El hook murió con el hilo de la instancia cerrada.
+                    // Lo reinstalamos en el hilo de la siguiente instancia sobreviviente.
+                    if (_hookId != IntPtr.Zero)
+                    {
+                        UnhookWindowsHookEx(_hookId);
+                        _hookId = IntPtr.Zero;
+                    }
+                    
+                    var survivor = _instances[0];
+                    if (survivor.IsHandleCreated)
+                        survivor.BeginInvoke(new Action(InstallHook));
+                }
+            }
+        }
+
+        private static void InstallHook()
+        {
+            if (_hookId != IntPtr.Zero) return;
+            using var curProc = Process.GetCurrentProcess();
+            using var curMod = curProc.MainModule;
+            if (curMod == null) return;
+            _proc = HookCallback;
+            _hookId = SetWindowsHookEx(WH_KEYBOARD_LL, _proc, GetModuleHandle(curMod.ModuleName), 0);
+        }
+
+        private static IntPtr HookCallback(int nCode, IntPtr wParam, IntPtr lParam)
+        {
+            if (nCode >= 0 && (wParam == (IntPtr)WM_KEYDOWN || wParam == (IntPtr)WM_SYSKEYDOWN))
+            {
+                int vkCode = Marshal.ReadInt32(lParam);
+                
+                if (IsWintabberHotkey(vkCode))
+                {
+                    Form1? target = null;
+                    lock (_lock)
+                    {
+                        if (_instances.Count > 0)
+                            target = FindActiveInstance();
+                    }
+
+                    if (target != null)
+                    {
+                        // BeginInvoke asegura que la acción se ejecute en el hilo de UI correcto,
+                        // evitando crashes de Cross-Thread entre instancias.
+                        target.BeginInvoke(new Action(() => target.HandleHotkey(vkCode)));
+                        return (IntPtr)1; // Tecla consumida (no llega a Dofus)
+                    }
+                }
+            }
+            return CallNextHookEx(_hookId, nCode, wParam, lParam);
+        }
+
+        private static bool IsWintabberHotkey(int vkCode)
+        {
+            if (vkCode >= (int)Keys.F1 && vkCode <= (int)Keys.F7) return true;
+            if (IsCtrlAltDown() && vkCode >= (int)Keys.D1 && vkCode <= (int)Keys.D9) return true;
+            return false;
+        }
+
+        private static Form1? FindActiveInstance()
+        {
+            IntPtr fg = GetForegroundWindow();
+            
+            // 1. ¿El foco está directamente en el Form1 de Wintabber?
+            foreach (var inst in _instances)
+            {
+                if (inst.Handle == fg)
+                {
+                    _lastActiveInstance = inst;
+                    return inst;
+                }
+            }
+
+            // 2. ¿El foco está en una ventana de Dofus embebida?
+            // Esto es MÁS CONFIABLE que usar GetParent entre procesos distintos.
+            foreach (var inst in _instances)
+            {
+                if (inst.OwnsHwnd(fg))
+                {
+                    _lastActiveInstance = inst;
+                    return inst;
+                }
+            }
+
+            // 3. Respaldo: Caminar hacia arriba con GetParent (por si acaso)
+            IntPtr current = fg;
+            while (current != IntPtr.Zero)
+            {
+                foreach (var inst in _instances)
+                {
+                    if (inst.Handle == current)
+                    {
+                        _lastActiveInstance = inst;
+                        return inst;
+                    }
+                }
+                current = GetParent(current);
+            }
+
+            // 4. Último recurso: usar la última instancia que tuvo foco
+            if (_lastActiveInstance != null && _instances.Contains(_lastActiveInstance))
+                return _lastActiveInstance;
+
+            return _instances.FirstOrDefault();
+        }
+
+        internal static bool IsCtrlAltDown()
+        {
+            return (GetKeyState((int)Keys.ControlKey) & 0x8000) != 0 &&
+                   (GetKeyState((int)Keys.Menu) & 0x8000) != 0;
+        }
+
+        // ── P/Invoke del Hook ─────────────────────────────────────────────
+        private delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool UnhookWindowsHookEx(IntPtr hhk);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Auto, SetLastError = true)]
+        private static extern IntPtr GetModuleHandle(string lpModuleName);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetParent(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern short GetKeyState(int nVirtKey);
+
+        internal static void SetLastActive(Form1 instance)
+        {
+            lock (_lock)
+            {
+                if (_instances.Contains(instance))
+                    _lastActiveInstance = instance;
+            }
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     //  Form1 — Ventana principal
     // ════════════════════════════════════════════════════════════════════════
     public partial class Form1 : Form
@@ -268,23 +461,8 @@ namespace DofusMiniTabber
         private bool _autotradeEnabled = true;
         private bool _autogroupEnabled = true;
 
-        // ── Monitor de red (en-proceso, sin IPC) ─────────────────────────────
+        // ── Monitor de red ─────────────────────────────────────────────────────
         private DofusNetMonitor? _monitor;
-
-        // ── Hotkeys ───────────────────────────────────────────────────────────
-        private const int WM_HOTKEY              = 0x0312;
-        private const int HOTKEY_ID_PREV         = 1;
-        private const int HOTKEY_ID_NEXT         = 2;
-        private const int HOTKEY_ID_TOGGLE_MENU  = 3;
-        private const int HOTKEY_ID_SAVE_POS     = 4;
-        private const int HOTKEY_ID_RESTORE_POS  = 5;
-        private const int HOTKEY_ID_MANAGE       = 6;
-        private const int HOTKEY_ID_NEW_INSTANCE = 7;
-        private const int HOTKEY_ID_NUM_START    = 10;
-
-        private const uint MOD_ALT      = 0x0001;
-        private const uint MOD_CONTROL  = 0x0002;
-        private const uint MOD_NOREPEAT = 0x4000;
 
         // ── Estilos de ventana ────────────────────────────────────────────────
         private const int GWL_STYLE      = -16;
@@ -293,6 +471,7 @@ namespace DofusMiniTabber
         private const int WS_BORDER      = 0x00800000;
         private const int WS_DLGFRAME    = 0x00400000;
         private const int SW_SHOW        = 5;
+        private const int WM_MOUSEACTIVATE = 0x0021;
         private const int SWP_NOZORDER   = 0x0004;
         private const int SWP_NOMOVE     = 0x0002;
         private const int SWP_NOSIZE     = 0x0001;
@@ -320,8 +499,6 @@ namespace DofusMiniTabber
         [DllImport("user32.dll")] private static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] private static extern int GetWindowLong(IntPtr h, int idx);
         [DllImport("user32.dll", EntryPoint = "SetWindowLongW")] private static extern int SetWindowLong(IntPtr h, int idx, int val);
-        [DllImport("user32.dll")] private static extern bool RegisterHotKey(IntPtr h, int id, uint mod, uint vk);
-        [DllImport("user32.dll")] private static extern bool UnregisterHotKey(IntPtr h, int id);
         [DllImport("user32.dll")] private static extern bool RedrawWindow(IntPtr h, IntPtr rect, IntPtr rgn, uint flags);
         [DllImport("user32.dll")] private static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
         [DllImport("kernel32.dll")] private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
@@ -334,6 +511,8 @@ namespace DofusMiniTabber
         [DllImport("user32.dll")] private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
         [DllImport("kernel32.dll")] private static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")] private static extern bool FlashWindowEx(ref FLASHWINFO pwfi);
+
+        [DllImport("user32.dll")] private static extern IntPtr SetFocus(IntPtr hWnd);
 
         [StructLayout(LayoutKind.Sequential)]
         private struct FLASHWINFO
@@ -351,7 +530,6 @@ namespace DofusMiniTabber
 
         private delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lp);
 
-        // Contador estático para IDs de instancia
         private static int _nextInstanceId = 1;
         private static readonly object _instanceLock = new();
 
@@ -364,8 +542,17 @@ namespace DofusMiniTabber
             ConfigureForm();
             BuildUi();
             SetupTrayIcon();
-            RegisterBaseHotkeys();
-            RegisterNumberHotkeys();
+            
+            // Se registra DESPUÉS de que Windows cree la ventana física
+            HandleCreated += (_, _) => GlobalHookManager.Register(this);
+
+            // FORZAR FOCO EN INSTANCIAS SECUNDARIAS:
+            // Esto soluciona el tener que hacer spam de clicks para activar la ventana
+            Shown += (_, _) =>
+            {
+                ForceWindowToForeground();
+                GlobalHookManager.SetLastActive(this); // Asegura que los hotkeys vayan aquí
+            };
 
             _updateTitleTimer.Interval = 300;
             _updateTitleTimer.Tick += (_, _) => UpdateDynamicTitles();
@@ -414,6 +601,11 @@ namespace DofusMiniTabber
                 _resizeDebounceTimer.Stop();
                 _monitor?.Stop();
             };
+            
+            // Respaldo adicional: Si por alguna razón el click no dispara WM_MOUSEACTIVATE,
+            // la activación normal de la ventana sí actualiza el destino de los hotkeys.
+            Activated += (_, _) => GlobalHookManager.SetLastActive(this);
+
             TopMost     = false;
         }
 
@@ -642,7 +834,36 @@ namespace DofusMiniTabber
         }
 
         // ═════════════════════════════════════════════════════════════════════
-        //  Nueva Instancia — hilo STA propio, sin Mutex, sin Process.Start
+        //  Lógica de Hotkeys (Invocada de forma segura por GlobalHookManager)
+        // ═════════════════════════════════════════════════════════════════════
+        internal void HandleHotkey(int vkCode)
+        {
+            if (_isDisposing) return;
+            
+            if (vkCode == (int)Keys.F1) { PrevTab(); return; }
+            if (vkCode == (int)Keys.F2) { NextTab(); return; }
+            if (vkCode == (int)Keys.F3) { ToggleFloatingMenu(); return; }
+            if (vkCode == (int)Keys.F4) { SaveCurrentPositions(); return; }
+            if (vkCode == (int)Keys.F5) { QuickRestoreLayout(); return; }
+            if (vkCode == (int)Keys.F6) { OpenLayoutManager(); return; }
+            if (vkCode == (int)Keys.F7) { OpenNewInstance(); return; }
+
+            if (GlobalHookManager.IsCtrlAltDown())
+            {
+                if (vkCode >= (int)Keys.D1 && vkCode <= (int)Keys.D9)
+                {
+                    JumpToTab(vkCode - (int)Keys.D1);
+                }
+            }
+        }
+
+        internal bool OwnsHwnd(IntPtr hwnd)
+        {
+            return _embeddedByHwnd.ContainsKey(hwnd);
+        }
+
+        // ═════════════════════════════════════════════════════════════════════
+        //  Nueva Instancia
         // ═════════════════════════════════════════════════════════════════════
         private void OpenNewInstance()
         {
@@ -661,27 +882,22 @@ namespace DofusMiniTabber
                     catch (Exception ex)
                     {
                         Debug.WriteLine($"[Instance {_instanceId}] Spawn error: {ex.Message}");
-                        try
-                        {
-                            MessageBox.Show(
-                                $"Error al abrir nueva instancia:\n{ex.Message}",
-                                "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                        }
+                        try { MessageBox.Show($"Error al abrir nueva instancia:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error); }
                         catch { }
                     }
                 })
                 {
                     Name = $"Wintabber-Instance-{_instanceId + 1}",
-                    IsBackground = true
+                    // IsBackground = false IMPIDE que el CLR mate este hilo 
+                    // si se cierra la instancia #1, permitiendo liberar las ventanas correctamente.
+                    IsBackground = false 
                 };
                 thread.SetApartmentState(ApartmentState.STA);
                 thread.Start();
             }
             catch (Exception ex)
             {
-                MessageBox.Show(
-                    $"No se pudo abrir una nueva instancia:\n{ex.Message}",
-                    "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show($"No se pudo abrir una nueva instancia:\n{ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -733,46 +949,20 @@ namespace DofusMiniTabber
             }
         }
 
-        private void RegisterBaseHotkeys()
-        {
-            RegisterHotKey(Handle, HOTKEY_ID_PREV,          MOD_NOREPEAT, (uint)Keys.F1);
-            RegisterHotKey(Handle, HOTKEY_ID_NEXT,          MOD_NOREPEAT, (uint)Keys.F2);
-            RegisterHotKey(Handle, HOTKEY_ID_TOGGLE_MENU,   MOD_NOREPEAT, (uint)Keys.F3);
-            RegisterHotKey(Handle, HOTKEY_ID_SAVE_POS,      MOD_NOREPEAT, (uint)Keys.F4);
-            RegisterHotKey(Handle, HOTKEY_ID_RESTORE_POS,   MOD_NOREPEAT, (uint)Keys.F5);
-            RegisterHotKey(Handle, HOTKEY_ID_MANAGE,        MOD_NOREPEAT, (uint)Keys.F6);
-            RegisterHotKey(Handle, HOTKEY_ID_NEW_INSTANCE,  MOD_NOREPEAT, (uint)Keys.F7);
-        }
-
-        private void RegisterNumberHotkeys()
-        {
-            for (int i = 1; i <= 9; i++)
-                RegisterHotKey(Handle, HOTKEY_ID_NUM_START + i - 1,
-                               MOD_CONTROL | MOD_ALT, (uint)(Keys.D0 + i));
-        }
-
         protected override void WndProc(ref Message m)
         {
+            // MAGIA: Al hacer click en el juego embebido, Windows envía este mensaje al Form1.
+            // Lo capturamos ANTES de que Dofus robe el foco, así el Hook sabe a qué instancia mandar F1/F2.
+            if (m.Msg == WM_MOUSEACTIVATE)
+            {
+                GlobalHookManager.SetLastActive(this);
+            }
+
             if (m.Msg != 0 && (uint)m.Msg == Program.WM_BRING_TO_FRONT)
             {
                 RestoreWindow();
                 return;
             }
-
-            if (m.Msg == WM_HOTKEY)
-            {
-                var id = m.WParam.ToInt32();
-                if      (id == HOTKEY_ID_PREV)          PrevTab();
-                else if (id == HOTKEY_ID_NEXT)          NextTab();
-                else if (id == HOTKEY_ID_TOGGLE_MENU)   ToggleFloatingMenu();
-                else if (id == HOTKEY_ID_SAVE_POS)      SaveCurrentPositions();
-                else if (id == HOTKEY_ID_RESTORE_POS)   QuickRestoreLayout();
-                else if (id == HOTKEY_ID_MANAGE)        OpenLayoutManager();
-                else if (id == HOTKEY_ID_NEW_INSTANCE)  OpenNewInstance();
-                else if (id >= HOTKEY_ID_NUM_START && id <= HOTKEY_ID_NUM_START + 8)
-                    JumpToTab(id - HOTKEY_ID_NUM_START);
-            }
-
             base.WndProc(ref m);
         }
 
@@ -893,21 +1083,47 @@ namespace DofusMiniTabber
                 if (IsIconic(hwnd))
                     ShowWindow(hwnd, SW_SHOW);
 
+                // 1. Asegurar que Wintabber siga siendo la ventana principal a nivel de Windows.
+                // Al ser Wintabber quien tiene el foco real, no hay parpadeo de cursor a nivel de escritorio.
                 IntPtr fg = GetForegroundWindow();
-                uint fgThread = GetWindowThreadProcessId(fg, out _);
-                uint myThread = GetCurrentThreadId();
-
-                if (fgThread != myThread)
+                if (fg != Handle)
                 {
-                    AttachThreadInput(fgThread, myThread, true);
-                    SetForegroundWindow(hwnd);
-                    BringWindowToTop(hwnd);
-                    AttachThreadInput(fgThread, myThread, false);
+                    uint fgThread = GetWindowThreadProcessId(fg, out _);
+                    uint myThread = GetCurrentThreadId();
+                    if (fgThread != myThread)
+                    {
+                        AttachThreadInput(fgThread, myThread, true);
+                        try { SetForegroundWindow(Handle); BringWindowToTop(Handle); }
+                        finally { AttachThreadInput(fgThread, myThread, false); }
+                    }
+                    else
+                    {
+                        SetForegroundWindow(Handle);
+                        BringWindowToTop(Handle);
+                    }
                 }
-                else
+
+                uint dofusThread = GetWindowThreadProcessId(hwnd, out _);
+                uint currentThread = GetCurrentThreadId();
+
+                // 2. Conectar el hilo de entrada de Dofus con el nuestro temporalmente
+                if (dofusThread != currentThread)
+                    AttachThreadInput(dofusThread, currentThread, true);
+
+                try
                 {
-                    SetForegroundWindow(hwnd);
+                    // 3. MAGIA: Usar SetFocus en lugar de SetForegroundWindow.
+                    // SetFocus mueve el foco del teclado DENTRO de Wintabber hacia Dofus,
+                    // SIN avisarle al gestor de ventanas del sistema operativo.
+                    // Esto elimina por completo el micro-parpadeo de 1ms del cursor (mano -> flecha -> mano).
+                    SetFocus(hwnd);
                     BringWindowToTop(hwnd);
+                }
+                finally
+                {
+                    // 4. Desconectar para evitar bloqueos si la ventana de Dofus se cierra inesperadamente
+                    if (dofusThread != currentThread)
+                        AttachThreadInput(dofusThread, currentThread, false);
                 }
             }
             catch { }
@@ -1025,8 +1241,7 @@ namespace DofusMiniTabber
             {
                 var positions = GetCurrentTabPositions();
                 WindowPositionManager.SaveConfiguration(layoutName, positions, description);
-                MessageBox.Show($"Layout '{layoutName}' guardado con {positions.Count} ventanas.",
-                    "Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Layout '{layoutName}' guardado con {positions.Count} ventanas.", "Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1099,8 +1314,7 @@ namespace DofusMiniTabber
             {
                 var positions = GetCurrentTabPositions();
                 WindowPositionManager.SaveConfiguration(layoutName, positions);
-                MessageBox.Show($"Layout '{layoutName}' guardado con {positions.Count} ventanas.",
-                    "Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Layout '{layoutName}' guardado con {positions.Count} ventanas.", "Guardado", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1115,8 +1329,7 @@ namespace DofusMiniTabber
                 var config = WindowPositionManager.LoadConfiguration(layoutName);
                 if (config == null)
                 {
-                    MessageBox.Show($"No se encontró el layout '{layoutName}'.",
-                        "Layout No Encontrado", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                    MessageBox.Show($"No se encontró el layout '{layoutName}'.", "Layout No Encontrado", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                     return;
                 }
 
@@ -1143,8 +1356,7 @@ namespace DofusMiniTabber
                 foreach (var t in orderedTabs) _tabs.TabPages.Add(t);
 
                 ReorderTabs();
-                MessageBox.Show($"Layout '{layoutName}' restaurado.",
-                    "Listo", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show($"Layout '{layoutName}' restaurado.", "Listo", MessageBoxButtons.OK, MessageBoxIcon.Information);
             }
             catch (Exception ex)
             {
@@ -1156,9 +1368,7 @@ namespace DofusMiniTabber
         {
             if (string.IsNullOrWhiteSpace(_preferredLayoutName))
             {
-                MessageBox.Show(
-                    "No hay ningún layout preferido configurado.\n\nUsa '📋 Layouts' y marca uno como preferido.",
-                    "Sin Layout Preferido", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                MessageBox.Show("No hay ningún layout preferido configurado.\n\nUsa '📋 Layouts' y marca uno como preferido.", "Sin Layout Preferido", MessageBoxButtons.OK, MessageBoxIcon.Information);
                 return;
             }
             RestoreLayout(_preferredLayoutName);
@@ -1285,6 +1495,7 @@ namespace DofusMiniTabber
         {
             _isDisposing = true;
             _monitor?.Stop();
+            GlobalHookManager.Unregister(this);
 
             _trayIcon.Visible = false;
             _trayIcon.Dispose();
@@ -1300,15 +1511,6 @@ namespace DofusMiniTabber
                 }
                 catch { }
             }
-
-            UnregisterHotKey(Handle, HOTKEY_ID_PREV);
-            UnregisterHotKey(Handle, HOTKEY_ID_NEXT);
-            UnregisterHotKey(Handle, HOTKEY_ID_TOGGLE_MENU);
-            UnregisterHotKey(Handle, HOTKEY_ID_SAVE_POS);
-            UnregisterHotKey(Handle, HOTKEY_ID_RESTORE_POS);
-            UnregisterHotKey(Handle, HOTKEY_ID_MANAGE);
-            UnregisterHotKey(Handle, HOTKEY_ID_NEW_INSTANCE);
-            for (int i = 0; i < 9; i++) UnregisterHotKey(Handle, HOTKEY_ID_NUM_START + i);
         }
 
         private static string GetWindowTitle(IntPtr hwnd)
